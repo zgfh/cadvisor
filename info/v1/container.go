@@ -23,6 +23,8 @@ type CpuSpec struct {
 	Limit    uint64 `json:"limit"`
 	MaxLimit uint64 `json:"max_limit"`
 	Mask     string `json:"mask,omitempty"`
+	Quota    uint64 `json:"quota,omitempty"`
+	Period   uint64 `json:"period,omitempty"`
 }
 
 type MemorySpec struct {
@@ -45,6 +47,8 @@ type ContainerSpec struct {
 
 	// Metadata labels associated with this container.
 	Labels map[string]string `json:"labels,omitempty"`
+	// Metadata envs associated with this container. Only whitelisted envs are added.
+	Envs map[string]string `json:"envs,omitempty"`
 
 	HasCpu bool    `json:"has_cpu"`
 	Cpu    CpuSpec `json:"cpu,omitempty"`
@@ -68,6 +72,9 @@ type ContainerSpec struct {
 
 // Container reference contains enough information to uniquely identify a container
 type ContainerReference struct {
+	// The container id
+	Id string `json:"id,omitempty"`
+
 	// The absolute name of the container. This is unique on the machine.
 	Name string `json:"name"`
 
@@ -78,6 +85,8 @@ type ContainerReference struct {
 	// Namespace under which the aliases of a container are unique.
 	// An example of a namespace is "docker" for Docker containers.
 	Namespace string `json:"namespace,omitempty"`
+
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // Sorts by container name.
@@ -257,7 +266,7 @@ type LoadStats struct {
 // CPU usage time statistics.
 type CpuUsage struct {
 	// Total CPU usage.
-	// Units: nanoseconds
+	// Unit: nanoseconds.
 	Total uint64 `json:"total"`
 
 	// Per CPU/core usage of the container.
@@ -265,17 +274,31 @@ type CpuUsage struct {
 	PerCpu []uint64 `json:"per_cpu_usage,omitempty"`
 
 	// Time spent in user space.
-	// Unit: nanoseconds
+	// Unit: nanoseconds.
 	User uint64 `json:"user"`
 
 	// Time spent in kernel space.
-	// Unit: nanoseconds
+	// Unit: nanoseconds.
 	System uint64 `json:"system"`
+}
+
+// Cpu Completely Fair Scheduler statistics.
+type CpuCFS struct {
+	// Total number of elapsed enforcement intervals.
+	Periods uint64 `json:"periods"`
+
+	// Total number of times tasks in the cgroup have been throttled.
+	ThrottledPeriods uint64 `json:"throttled_periods"`
+
+	// Total time duration for which tasks in the cgroup have been throttled.
+	// Unit: nanoseconds.
+	ThrottledTime uint64 `json:"throttled_time"`
 }
 
 // All CPU usage metrics are cumulative from the creation of the container
 type CpuStats struct {
 	Usage CpuUsage `json:"usage"`
+	CFS   CpuCFS   `json:"cfs"`
 	// Smoothed average of number of runnable threads x 1000.
 	// We multiply by thousand to avoid using floats, but preserving precision.
 	// Load is smoothed over the last 10 seconds. Instantaneous value can be read
@@ -305,6 +328,19 @@ type MemoryStats struct {
 	// accessed.
 	// Units: Bytes.
 	Usage uint64 `json:"usage"`
+
+	// Number of bytes of page cache memory.
+	// Units: Bytes.
+	Cache uint64 `json:"cache"`
+
+	// The amount of anonymous and swap cache memory (includes transparent
+	// hugepages).
+	// Units: Bytes.
+	RSS uint64 `json:"rss"`
+
+	// The amount of swap currently used by the processes in this cgroup
+	// Units: Bytes.
+	Swap uint64 `json:"swap"`
 
 	// The amount of working set memory, this includes recently accessed memory,
 	// dirty memory, and kernel memory. Working set is <= "usage".
@@ -381,14 +417,30 @@ type FsStats struct {
 	// The block device name associated with the filesystem.
 	Device string `json:"device,omitempty"`
 
+	// Type of the filesytem.
+	Type string `json:"type"`
+
 	// Number of bytes that can be consumed by the container on this filesystem.
 	Limit uint64 `json:"capacity"`
 
 	// Number of bytes that is consumed by the container on this filesystem.
 	Usage uint64 `json:"usage"`
 
+	// Base Usage that is consumed by the container's writable layer.
+	// This field is only applicable for docker container's as of now.
+	BaseUsage uint64 `json:"base_usage"`
+
 	// Number of bytes available for non-root user.
 	Available uint64 `json:"available"`
+
+	// HasInodes when true, indicates that Inodes info will be available.
+	HasInodes bool `json:"has_inodes"`
+
+	// Number of Inodes
+	Inodes uint64 `json:"inodes"`
+
+	// Number of available Inodes
+	InodesFree uint64 `json:"inodes_free"`
 
 	// Number of reads completed
 	// This is the total number of reads completed successfully.

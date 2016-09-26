@@ -15,6 +15,7 @@
 package metrics
 
 import (
+	"errors"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
@@ -55,8 +56,20 @@ func (p testSubcontainersInfoProvider) SubcontainersInfo(string, *info.Container
 				Aliases: []string{"testcontaineralias"},
 			},
 			Spec: info.ContainerSpec{
-				Image:        "test",
+				Image:  "test",
+				HasCpu: true,
+				Cpu: info.CpuSpec{
+					Limit:  1000,
+					Period: 100000,
+					Quota:  10000,
+				},
 				CreationTime: time.Unix(1257894000, 0),
+				Labels: map[string]string{
+					"foo.label": "bar",
+				},
+				Envs: map[string]string{
+					"foo+env": "prod",
+				},
 			},
 			Stats: []*info.ContainerStats{
 				{
@@ -66,6 +79,11 @@ func (p testSubcontainersInfoProvider) SubcontainersInfo(string, *info.Container
 							PerCpu: []uint64{2, 3, 4, 5},
 							User:   6,
 							System: 7,
+						},
+						CFS: info.CpuCFS{
+							Periods:          723,
+							ThrottledPeriods: 18,
+							ThrottledTime:    1724314000,
 						},
 					},
 					Memory: info.MemoryStats{
@@ -79,6 +97,9 @@ func (p testSubcontainersInfoProvider) SubcontainersInfo(string, *info.Container
 							Pgfault:    12,
 							Pgmajfault: 13,
 						},
+						Cache: 14,
+						RSS:   15,
+						Swap:  8192,
 					},
 					Network: info.NetworkStats{
 						InterfaceStats: info.InterfaceStats{
@@ -109,6 +130,8 @@ func (p testSubcontainersInfoProvider) SubcontainersInfo(string, *info.Container
 					Filesystem: []info.FsStats{
 						{
 							Device:          "sda1",
+							InodesFree:      524288,
+							Inodes:          2097152,
 							Limit:           22,
 							Usage:           23,
 							ReadsCompleted:  24,
@@ -125,6 +148,8 @@ func (p testSubcontainersInfoProvider) SubcontainersInfo(string, *info.Container
 						},
 						{
 							Device:          "sda2",
+							InodesFree:      262144,
+							Inodes:          2097152,
 							Limit:           37,
 							Usage:           38,
 							ReadsCompleted:  39,
@@ -154,17 +179,26 @@ func (p testSubcontainersInfoProvider) SubcontainersInfo(string, *info.Container
 }
 
 var (
-	includeRe = regexp.MustCompile(`^(?:(?:# HELP |# TYPE)container_|cadvisor_version_info\{)`)
+	includeRe = regexp.MustCompile(`^(?:(?:# HELP |# TYPE )?container_|cadvisor_version_info\{)`)
 	ignoreRe  = regexp.MustCompile(`^container_last_seen\{`)
 )
 
 func TestPrometheusCollector(t *testing.T) {
-	prometheus.MustRegister(NewPrometheusCollector(testSubcontainersInfoProvider{}, nil))
+	c := NewPrometheusCollector(testSubcontainersInfoProvider{}, func(container *info.ContainerInfo) map[string]string {
+		s := DefaultContainerLabels(container)
+		s["zone.name"] = "hello"
+		return s
+	})
+	prometheus.MustRegister(c)
+	defer prometheus.Unregister(c)
 
+	testPrometheusCollector(t, c, "testdata/prometheus_metrics")
+}
+
+func testPrometheusCollector(t *testing.T, c *PrometheusCollector, metricsFile string) {
 	rw := httptest.NewRecorder()
 	prometheus.Handler().ServeHTTP(rw, &http.Request{})
 
-	metricsFile := "testdata/prometheus_metrics"
 	wantMetrics, err := ioutil.ReadFile(metricsFile)
 	if err != nil {
 		t.Fatalf("unable to read input test file %s", metricsFile)
@@ -182,7 +216,55 @@ func TestPrometheusCollector(t *testing.T) {
 			continue
 		}
 		if want != gotLines[i] {
-			t.Fatalf("want %s, got %s", want, gotLines[i])
+			t.Fatalf("unexpected metric line\nwant: %s\nhave: %s", want, gotLines[i])
 		}
 	}
+}
+
+type erroringSubcontainersInfoProvider struct {
+	successfulProvider testSubcontainersInfoProvider
+	shouldFail         bool
+}
+
+func (p *erroringSubcontainersInfoProvider) GetVersionInfo() (*info.VersionInfo, error) {
+	if p.shouldFail {
+		return nil, errors.New("Oops 1")
+	}
+	return p.successfulProvider.GetVersionInfo()
+}
+
+func (p *erroringSubcontainersInfoProvider) GetMachineInfo() (*info.MachineInfo, error) {
+	if p.shouldFail {
+		return nil, errors.New("Oops 2")
+	}
+	return p.successfulProvider.GetMachineInfo()
+}
+
+func (p *erroringSubcontainersInfoProvider) SubcontainersInfo(
+	a string, r *info.ContainerInfoRequest) ([]*info.ContainerInfo, error) {
+	if p.shouldFail {
+		return []*info.ContainerInfo{}, errors.New("Oops 3")
+	}
+	return p.successfulProvider.SubcontainersInfo(a, r)
+}
+
+func TestPrometheusCollector_scrapeFailure(t *testing.T) {
+	provider := &erroringSubcontainersInfoProvider{
+		successfulProvider: testSubcontainersInfoProvider{},
+		shouldFail:         true,
+	}
+
+	c := NewPrometheusCollector(provider, func(container *info.ContainerInfo) map[string]string {
+		s := DefaultContainerLabels(container)
+		s["zone.name"] = "hello"
+		return s
+	})
+	prometheus.MustRegister(c)
+	defer prometheus.Unregister(c)
+
+	testPrometheusCollector(t, c, "testdata/prometheus_metrics_failure")
+
+	provider.shouldFail = false
+
+	testPrometheusCollector(t, c, "testdata/prometheus_metrics")
 }

@@ -15,10 +15,14 @@
 package fs
 
 import (
+	"errors"
 	"io/ioutil"
 	"os"
+	"reflect"
 	"testing"
+	"time"
 
+	"github.com/docker/docker/pkg/mount"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -96,7 +100,7 @@ func TestDirUsage(t *testing.T) {
 	fi, err := f.Stat()
 	as.NoError(err)
 	expectedSize := uint64(fi.Size())
-	size, err := fsInfo.GetDirUsage(dir)
+	size, err := fsInfo.GetDirUsage(dir, time.Minute)
 	as.NoError(err)
 	as.True(expectedSize <= size, "expected dir size to be at-least %d; got size: %d", expectedSize, size)
 }
@@ -153,6 +157,342 @@ func TestParseDMTable(t *testing.T) {
 		}
 		if dataBlkSize != tt.dataBlkSize {
 			t.Errorf("parseDMTable(%q) wrong dataBlkSize value => %q, want %q", tt.dmTable, dataBlkSize, tt.dataBlkSize)
+		}
+	}
+}
+
+func TestAddSystemRootLabel(t *testing.T) {
+	tests := []struct {
+		mounts   []*mount.Info
+		expected string
+	}{
+		{
+			mounts: []*mount.Info{
+				{Source: "/dev/sda1", Mountpoint: "/foo"},
+				{Source: "/dev/sdb1", Mountpoint: "/"},
+			},
+			expected: "/dev/sdb1",
+		},
+	}
+
+	for i, tt := range tests {
+		fsInfo := &RealFsInfo{
+			labels:     map[string]string{},
+			partitions: map[string]partition{},
+		}
+		fsInfo.addSystemRootLabel(tt.mounts)
+
+		if source, ok := fsInfo.labels[LabelSystemRoot]; !ok || source != tt.expected {
+			t.Errorf("case %d: expected mount source '%s', got '%s'", i, tt.expected, source)
+		}
+	}
+}
+
+type testDmsetup struct {
+	data []byte
+	err  error
+}
+
+func (*testDmsetup) Message(deviceName string, sector int, message string) ([]byte, error) {
+	return nil, nil
+}
+
+func (*testDmsetup) Status(deviceName string) ([]byte, error) {
+	return nil, nil
+}
+
+func (t *testDmsetup) Table(poolName string) ([]byte, error) {
+	return t.data, t.err
+}
+
+func TestGetDockerDeviceMapperInfo(t *testing.T) {
+	tests := []struct {
+		name              string
+		driver            string
+		driverStatus      map[string]string
+		dmsetupTable      string
+		dmsetupTableError error
+		expectedDevice    string
+		expectedPartition *partition
+		expectedError     bool
+	}{
+		{
+			name:              "not devicemapper",
+			driver:            "btrfs",
+			expectedDevice:    "",
+			expectedPartition: nil,
+			expectedError:     false,
+		},
+		{
+			name:              "nil driver status",
+			driver:            "devicemapper",
+			driverStatus:      nil,
+			expectedDevice:    "",
+			expectedPartition: nil,
+			expectedError:     true,
+		},
+		{
+			name:              "loopback",
+			driver:            "devicemapper",
+			driverStatus:      map[string]string{"Data loop file": "/var/lib/docker/devicemapper/devicemapper/data"},
+			expectedDevice:    "",
+			expectedPartition: nil,
+			expectedError:     false,
+		},
+		{
+			name:              "missing pool name",
+			driver:            "devicemapper",
+			driverStatus:      map[string]string{},
+			expectedDevice:    "",
+			expectedPartition: nil,
+			expectedError:     true,
+		},
+		{
+			name:              "error invoking dmsetup",
+			driver:            "devicemapper",
+			driverStatus:      map[string]string{"Pool Name": "vg_vagrant-docker--pool"},
+			dmsetupTableError: errors.New("foo"),
+			expectedDevice:    "",
+			expectedPartition: nil,
+			expectedError:     true,
+		},
+		{
+			name:              "unable to parse dmsetup table",
+			driver:            "devicemapper",
+			driverStatus:      map[string]string{"Pool Name": "vg_vagrant-docker--pool"},
+			dmsetupTable:      "no data here!",
+			expectedDevice:    "",
+			expectedPartition: nil,
+			expectedError:     true,
+		},
+		{
+			name:           "happy path",
+			driver:         "devicemapper",
+			driverStatus:   map[string]string{"Pool Name": "vg_vagrant-docker--pool"},
+			dmsetupTable:   "0 53870592 thin-pool 253:2 253:3 1024 0 1 skip_block_zeroing",
+			expectedDevice: "vg_vagrant-docker--pool",
+			expectedPartition: &partition{
+				fsType:    "devicemapper",
+				major:     253,
+				minor:     3,
+				blockSize: 1024,
+			},
+			expectedError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		fsInfo := &RealFsInfo{
+			dmsetup: &testDmsetup{
+				data: []byte(tt.dmsetupTable),
+			},
+		}
+
+		dockerCtx := DockerContext{
+			Driver:       tt.driver,
+			DriverStatus: tt.driverStatus,
+		}
+
+		device, partition, err := fsInfo.getDockerDeviceMapperInfo(dockerCtx)
+
+		if tt.expectedError && err == nil {
+			t.Errorf("%s: expected error but got nil", tt.name)
+			continue
+		}
+		if !tt.expectedError && err != nil {
+			t.Errorf("%s: unexpected error: %v", tt.name, err)
+			continue
+		}
+
+		if e, a := tt.expectedDevice, device; e != a {
+			t.Errorf("%s: device: expected %q, got %q", tt.name, e, a)
+		}
+
+		if e, a := tt.expectedPartition, partition; !reflect.DeepEqual(e, a) {
+			t.Errorf("%s: partition: expected %#v, got %#v", tt.name, e, a)
+		}
+	}
+}
+
+func TestAddDockerImagesLabel(t *testing.T) {
+	tests := []struct {
+		name                           string
+		driver                         string
+		driverStatus                   map[string]string
+		dmsetupTable                   string
+		getDockerDeviceMapperInfoError error
+		mounts                         []*mount.Info
+		expectedDockerDevice           string
+		expectedPartition              *partition
+	}{
+		{
+			name:         "devicemapper, not loopback",
+			driver:       "devicemapper",
+			driverStatus: map[string]string{"Pool Name": "vg_vagrant-docker--pool"},
+			dmsetupTable: "0 53870592 thin-pool 253:2 253:3 1024 0 1 skip_block_zeroing",
+			mounts: []*mount.Info{
+				{
+					Source:     "/dev/mapper/vg_vagrant-lv_root",
+					Mountpoint: "/",
+					Fstype:     "devicemapper",
+				},
+			},
+			expectedDockerDevice: "vg_vagrant-docker--pool",
+			expectedPartition: &partition{
+				fsType:    "devicemapper",
+				major:     253,
+				minor:     3,
+				blockSize: 1024,
+			},
+		},
+		{
+			name:         "devicemapper, loopback on non-root partition",
+			driver:       "devicemapper",
+			driverStatus: map[string]string{"Data loop file": "/var/lib/docker/devicemapper/devicemapper/data"},
+			mounts: []*mount.Info{
+				{
+					Source:     "/dev/mapper/vg_vagrant-lv_root",
+					Mountpoint: "/",
+					Fstype:     "devicemapper",
+				},
+				{
+					Source:     "/dev/sdb1",
+					Mountpoint: "/var/lib/docker/devicemapper",
+				},
+			},
+			expectedDockerDevice: "/dev/sdb1",
+		},
+		{
+			name: "multiple mounts - innermost check",
+			mounts: []*mount.Info{
+				{
+					Source:     "/dev/sda1",
+					Mountpoint: "/",
+					Fstype:     "ext4",
+				},
+				{
+					Source:     "/dev/sdb1",
+					Mountpoint: "/var/lib/docker",
+					Fstype:     "ext4",
+				},
+				{
+					Source:     "/dev/sdb2",
+					Mountpoint: "/var/lib/docker/btrfs",
+					Fstype:     "btrfs",
+				},
+			},
+			expectedDockerDevice: "/dev/sdb2",
+		},
+		{
+			name: "root fs inside container, docker-images bindmount",
+			mounts: []*mount.Info{
+				{
+					Source:     "overlay",
+					Mountpoint: "/",
+					Fstype:     "overlay",
+				},
+				{
+					Source:     "/dev/sda1",
+					Mountpoint: "/var/lib/docker",
+					Fstype:     "ext4",
+				},
+			},
+			expectedDockerDevice: "/dev/sda1",
+		},
+	}
+
+	for _, tt := range tests {
+		fsInfo := &RealFsInfo{
+			labels:     map[string]string{},
+			partitions: map[string]partition{},
+			dmsetup: &testDmsetup{
+				data: []byte(tt.dmsetupTable),
+			},
+		}
+
+		context := Context{
+			Docker: DockerContext{
+				Root:         "/var/lib/docker",
+				Driver:       tt.driver,
+				DriverStatus: tt.driverStatus,
+			},
+		}
+
+		fsInfo.addDockerImagesLabel(context, tt.mounts)
+
+		if e, a := tt.expectedDockerDevice, fsInfo.labels[LabelDockerImages]; e != a {
+			t.Errorf("%s: docker device: expected %q, got %q", tt.name, e, a)
+		}
+
+		if tt.expectedPartition == nil {
+			continue
+		}
+		if e, a := *tt.expectedPartition, fsInfo.partitions[tt.expectedDockerDevice]; !reflect.DeepEqual(e, a) {
+			t.Errorf("%s: docker partition: expected %#v, got %#v", tt.name, e, a)
+		}
+	}
+}
+
+func TestProcessMounts(t *testing.T) {
+	tests := []struct {
+		name             string
+		mounts           []*mount.Info
+		excludedPrefixes []string
+		expected         map[string]partition
+	}{
+		{
+			name: "unsupported fs types",
+			mounts: []*mount.Info{
+				{Fstype: "overlay"},
+				{Fstype: "somethingelse"},
+			},
+			expected: map[string]partition{},
+		},
+		{
+			name: "avoid bind mounts",
+			mounts: []*mount.Info{
+				{Root: "/", Mountpoint: "/", Source: "/dev/sda1", Fstype: "xfs", Major: 253, Minor: 0},
+				{Root: "/foo", Mountpoint: "/bar", Source: "/dev/sda1", Fstype: "xfs", Major: 253, Minor: 0},
+			},
+			expected: map[string]partition{
+				"/dev/sda1": {fsType: "xfs", mountpoint: "/", major: 253, minor: 0},
+			},
+		},
+		{
+			name: "exclude prefixes",
+			mounts: []*mount.Info{
+				{Root: "/", Mountpoint: "/someother", Source: "/dev/sda1", Fstype: "xfs", Major: 253, Minor: 2},
+				{Root: "/", Mountpoint: "/", Source: "/dev/sda2", Fstype: "xfs", Major: 253, Minor: 0},
+				{Root: "/", Mountpoint: "/excludeme", Source: "/dev/sda3", Fstype: "xfs", Major: 253, Minor: 1},
+			},
+			excludedPrefixes: []string{"/exclude", "/some"},
+			expected: map[string]partition{
+				"/dev/sda2": {fsType: "xfs", mountpoint: "/", major: 253, minor: 0},
+			},
+		},
+		{
+			name: "supported fs types",
+			mounts: []*mount.Info{
+				{Root: "/", Mountpoint: "/a", Source: "/dev/sda", Fstype: "ext3", Major: 253, Minor: 0},
+				{Root: "/", Mountpoint: "/b", Source: "/dev/sdb", Fstype: "ext4", Major: 253, Minor: 1},
+				{Root: "/", Mountpoint: "/c", Source: "/dev/sdc", Fstype: "btrfs", Major: 253, Minor: 2},
+				{Root: "/", Mountpoint: "/d", Source: "/dev/sdd", Fstype: "xfs", Major: 253, Minor: 3},
+				{Root: "/", Mountpoint: "/e", Source: "/dev/sde", Fstype: "zfs", Major: 253, Minor: 4},
+			},
+			expected: map[string]partition{
+				"/dev/sda": {fsType: "ext3", mountpoint: "/a", major: 253, minor: 0},
+				"/dev/sdb": {fsType: "ext4", mountpoint: "/b", major: 253, minor: 1},
+				"/dev/sdc": {fsType: "btrfs", mountpoint: "/c", major: 253, minor: 2},
+				"/dev/sdd": {fsType: "xfs", mountpoint: "/d", major: 253, minor: 3},
+				"/dev/sde": {fsType: "zfs", mountpoint: "/e", major: 253, minor: 4},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		actual := processMounts(test.mounts, test.excludedPrefixes)
+		if !reflect.DeepEqual(test.expected, actual) {
+			t.Errorf("%s: expected %#v, got %#v", test.name, test.expected, actual)
 		}
 	}
 }
